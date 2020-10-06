@@ -14,23 +14,25 @@ import android.content.pm.PackageManager
 import android.os.IBinder
 import android.os.ParcelUuid
 import android.util.Log
-import android.widget.RemoteViews
 import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
 import com.tran.andrew.airpodbattery.R
-import java.util.*
 import kotlin.collections.ArrayList
 
 class AirPodsService : Service() {
-    private val manufacturerId: Int = 76
-
     var leftAirPod: Chargeable = Chargeable.NULL
     var rightAirPod: Chargeable = Chargeable.NULL
     var case: Chargeable = Chargeable.NULL
 
     var airPodModel: AirPodModel? = null
-    var beacons: ArrayList<Beacon> = arrayListOf()
+    val beacons: ArrayList<Beacon> = arrayListOf()
+    val beaconHits: HashMap<String, Int> = hashMapOf()
 
     var connected = false
+        set(value) {
+            Log.d(logTag, "connected set to $value")
+            field = value
+        }
 
     private val listeners: Array<ConnectionListener> by lazy { ConnectionListener.listeners(this) }
     private val scanner: BluetoothLeScanner by lazy { getAdapter().bluetoothLeScanner }
@@ -41,10 +43,13 @@ class AirPodsService : Service() {
         try {
             listeners.forEach { it.register() }
         } catch (e: Exception) {
+            Log.e(logTag, "exception when registering listeners", e)
         }
 
         if (getAdapter().isEnabled) {
             startScanner()
+        } else {
+            Log.d(logTag, "bluetooth is not enabled")
         }
     }
 
@@ -58,32 +63,32 @@ class AirPodsService : Service() {
     }
 
     override fun onDestroy() {
+        listeners.forEach { it.unregister() }
         super.onDestroy()
-       listeners.forEach { it.unregister() }
     }
 
     internal fun startScanner() {
+        Log.d(logTag, "starting scanner")
+
         val filters = listOf(
             ScanFilter.Builder()
                 .setManufacturerData(
                     manufacturerId,
-                    ByteArray(27).apply {
+                    ByteArray(appleBytesSize).apply {
                         this[0] = 7
                         this[1] = 25
                     },
-                    ByteArray(27).apply {
-                        this[0] = 1
-                        this[1] = 1
+                    ByteArray(appleBytesSize).apply {
+                        this[0] = allBits
+                        this[1] = allBits
                     }
                 )
                 .build()
         )
-        val settings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-            .setReportDelay(0)
-            .setMatchMode(ScanSettings.MATCH_MODE_STICKY)
-            .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
-            .build()
+        val settings = ScanSettings.Builder().apply {
+            setReportDelay(5)
+            setScanMode(ScanSettings.SCAN_MODE_LOW_POWER)
+        }.build()
 
         if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_DENIED) {
             Log.d(this.javaClass.name, "permission denied!")
@@ -93,29 +98,19 @@ class AirPodsService : Service() {
             filters,
             settings,
             object : ScanCallback() {
-                override fun onScanFailed(errorCode: Int) {
-                    Log.d(this.javaClass.name, "scan failed")
-                    super.onScanFailed(errorCode)
-                }
-                override fun onBatchScanResults(results: MutableList<ScanResult>) {
-                    super.onBatchScanResults(results)
-                    results.forEach { onScanResult(ScanSettings.CALLBACK_TYPE_FIRST_MATCH, it) }
-                }
-
                 override fun onScanResult(callbackType: Int, result: ScanResult) {
-                    if (result.device?.bondState ?: 0 != BluetoothDevice.BOND_BONDED ||
-                        !AirPodModel.isAirPod(result.device!!) ||
-                        result.getAppleSpecificData().size != 27
-                    ) {
+                    if (!result.isDesired()) {
                         return
                     }
 
                     // Trim the list of beacons that have exceeded their TTL.
-                    beacons.add(Beacon(result = result))
+                    beacons.add(Beacon(scanResult = result))
+                    beaconHits[result.device.address] =
+                        beaconHits.getOrDefault(result.device.address, 0) + 1
                     beacons.removeAll(Beacon::isExpired)
-                    beacons.filterNot { it.result.rssi < -60 }
-                        .maxByOrNull { it.result.rssi }
-                        ?.result
+                    beacons.filterNot { it.scanResult.rssi < -60 }
+                        .maxByOrNull { it.scanResult.rssi }
+                        ?.scanResult
                         ?.getAppleSpecificData()
                         ?.let { decodeHex(it) }
                         ?.let {
@@ -133,7 +128,7 @@ class AirPodsService : Service() {
                                     (chargeStatus and 0b100) != 0
                                 )
                             }
-                            if (isManufacturerSpecificDataFlipped(it)) {
+                            if (isDataFlipped(it)) {
                                 leftAirPod = rightAirPod.also { rightAirPod = leftAirPod }
                             }
 
@@ -142,24 +137,47 @@ class AirPodsService : Service() {
                                 else -> AirPodModel.NORMAL
                             }
                         }
+                    Log.d(logTag, "beaconHits: $beaconHits")
+                }
+
+                override fun onBatchScanResults(results: MutableList<ScanResult>) {
+                    super.onBatchScanResults(results)
+                    results.forEach { onScanResult(ScanSettings.CALLBACK_TYPE_FIRST_MATCH, it) }
+                }
+
+                override fun onScanFailed(errorCode: Int) {
+                    Log.d(this.javaClass.name, "scan failed")
+                    super.onScanFailed(errorCode)
                 }
             }
         )
     }
 
+    /**
+     * Scan results:
+     * * Have fake MAC addresses.
+     * * Do not have UUIDs.
+     * * Do not have meaningful bond states.
+     *
+     * Therefore, we can only rely on the size of the manufacturer specific data bytes specific to Apple.
+     */
+    private fun ScanResult.isDesired(): Boolean = getAppleSpecificData().size == appleBytesSize
+
     private fun ScanResult.getAppleSpecificData(): ByteArray =
         this.scanRecord?.getManufacturerSpecificData(manufacturerId) ?: ByteArray(0)
 
-    private fun decodeHex(bytes: ByteArray): String = bytes.fold("") { s, b ->
-        return s + String.format("%02X", b)
-    }
+    private fun decodeHex(bytes: ByteArray): String = bytes
+        .fold("") { s, b ->
+            s + String.format("%02X", b)
+        }
 
-    private fun isManufacturerSpecificDataFlipped(data: String): Boolean =
-        (Integer.parseInt(data[10].toString(), 16) and 0x02).toChar() == '0'
+    private fun isDataFlipped(data: String): Boolean =
+        (Integer.parseInt(data[10].toString(), 16) and 0x02) == 0
 
     internal fun stopScanner() {
+        Log.d(logTag, "stopping scanner")
         scanner.stopScan(object : ScanCallback() {
-            override fun onScanResult(callbackType: Int, result: ScanResult?) {
+            override fun onScanResult(callbackType: Int, result: ScanResult) {
             }
         })
 
@@ -174,16 +192,16 @@ class AirPodsService : Service() {
         (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
 
     inner class NotificationThread : Thread() {
-        private val tag = "AirPods"
-        private val manager: NotificationManager
-            get() = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        private val channel = 1
+        private val channelId = "AirPods"
+        private val manager: NotificationManagerCompat by lazy { NotificationManagerCompat.from(this@AirPodsService) }
 
         init {
             manager.createNotificationChannel(
                 NotificationChannel(
-                    tag,
-                    tag,
-                    NotificationManager.IMPORTANCE_LOW
+                    channelId,
+                    "AirPods Battery",
+                    NotificationManager.IMPORTANCE_DEFAULT
                 ).apply {
                     enableVibration(false)
                     enableLights(false)
@@ -193,25 +211,58 @@ class AirPodsService : Service() {
 
         override fun run() {
             while (true) {
-                manager.notify(
-                    1,
-                    NotificationCompat.Builder(this@AirPodsService, tag).apply {
-                        setShowWhen(false)
-                        setOngoing(true)
-                        setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-                        setStyle(NotificationCompat.DecoratedCustomViewStyle())
-                        setSmallIcon(R.drawable.ic_launcher_background)
-                        setCustomContentView(RemoteViews(packageName, R.layout.notification).apply {
-                            setTextViewText(R.id.textView, "l=$leftAirPod, r=$rightAirPod, c=$case")
-                        })
-                        setCustomBigContentView(RemoteViews(packageName, R.layout.notification).apply {
-                            setTextViewText(R.id.textView, "l=$leftAirPod, r=$rightAirPod, c=$case")
-                        })
-                    }.build()
-                )
-                sleep(1_000)
+                if (connected) {
+                    val notification =
+                        NotificationCompat.Builder(this@AirPodsService, channelId).apply {
+                            setSmallIcon(R.drawable.ic_launcher_background)
+                            setContentTitle("AirPods Battery")
+                            setContentText("l:${leftAirPod.display()}, r:${rightAirPod.display()}, case:${case.display()}")
+
+                            setShowWhen(false)
+                            setOngoing(true)
+                            setAutoCancel(false)
+                            setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+
+//                        setStyle(NotificationCompat.DecoratedCustomViewStyle())
+//                        setCustomContentView(RemoteViews(packageName, R.layout.notification).apply {
+//                            populate(leftAirPod, rightAirPod, case)
+//                        })
+//                        setCustomBigContentView(
+//                            RemoteViews(
+//                                packageName,
+//                                R.layout.notification
+//                            ).apply {
+//                                populate(leftAirPod, rightAirPod, case)
+//                            }
+//                        )
+                        }.build()
+                    try {
+                        manager.notify(channel, notification)
+                    } catch (e: Exception) {
+                        Log.e(logTag, "exception creating notification", e)
+                        manager.cancel(channel)
+                        manager.notify(channel, notification)
+                    }
+                } else {
+                    manager.cancel(channel)
+                }
+
+
+                try {
+                    sleep(10_000)
+                } catch (e: Exception) {
+                    Log.e(logTag, "exception thrown during sleep for notification thread", e)
+                }
             }
         }
+    }
+
+    companion object {
+        private val logTag: String = AirPodsService::class.simpleName!!
+
+        private const val allBits: Byte = -1
+        private const val manufacturerId: Int = 76
+        private const val appleBytesSize: Int = 27
     }
 }
 
