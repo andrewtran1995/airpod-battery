@@ -3,6 +3,7 @@ package com.tran.andrew.airpodbattery.airpod
 import android.Manifest
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
@@ -15,6 +16,7 @@ import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
+import com.tran.andrew.airpodbattery.MainActivity
 import com.tran.andrew.airpodbattery.R
 import kotlin.collections.ArrayList
 
@@ -72,7 +74,7 @@ class AirPodsService : Service() {
         Log.d(logTag, "starting scanner")
 
         val settings = ScanSettings.Builder().apply {
-            setReportDelay(5)
+            setReportDelay(1)
             setScanMode(ScanSettings.SCAN_MODE_LOW_POWER)
         }.build()
 
@@ -126,8 +128,8 @@ class AirPodsService : Service() {
                 }
 
                 override fun onBatchScanResults(results: MutableList<ScanResult>) {
+                    results.forEach { onScanResult(ScanSettings.CALLBACK_TYPE_ALL_MATCHES, it) }
                     super.onBatchScanResults(results)
-                    results.forEach { onScanResult(ScanSettings.CALLBACK_TYPE_FIRST_MATCH, it) }
                 }
 
                 override fun onScanFailed(errorCode: Int) {
@@ -154,6 +156,23 @@ class AirPodsService : Service() {
 
     inner class NotificationThread : Thread() {
         private val manager: NotificationManagerCompat by lazy { NotificationManagerCompat.from(this@AirPodsService) }
+        private val notificationBuilder: NotificationCompat.Builder =
+            NotificationCompat.Builder(this@AirPodsService, notificationChannelID).apply {
+                setSmallIcon(R.drawable.ic_launcher_background)
+                setContentTitle("AirPods Battery")
+
+                setShowWhen(false)
+                setOngoing(true)
+                setOnlyAlertOnce(true)
+                setVibrate(null)
+                setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+
+                val intent = Intent(this@AirPodsService, MainActivity::class.java).apply {
+                    flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+                }
+                setContentIntent(PendingIntent.getActivity(this@AirPodsService, 0, intent, 0))
+                setAutoCancel(false)
+            }
 
         init {
             manager.createNotificationChannel(
@@ -172,19 +191,9 @@ class AirPodsService : Service() {
             while (true) {
                 try {
                     if (connected) {
-                        val notification =
-                            NotificationCompat.Builder(this@AirPodsService, notificationChannelID)
-                                .apply {
-                                    setSmallIcon(R.drawable.ic_launcher_background)
-                                    setContentTitle("AirPods Battery")
-                                    setContentText("l:${leftAirPod.display()}, r:${rightAirPod.display()}, case:${case.display()}")
-
-                                    setShowWhen(false)
-                                    setOngoing(true)
-                                    setAutoCancel(false)
-                                    setVibrate(null)
-                                    setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-                                }.build()
+                        val notification = notificationBuilder.apply {
+                            setContentText("l:${leftAirPod.display()}, r:${rightAirPod.display()}, case:${case.display()}")
+                        }.build()
                         try {
                             manager.notify(notificationChannel, notification)
                         } catch (e: Exception) {
