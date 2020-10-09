@@ -84,7 +84,7 @@ private data class Receiver (
                 override fun onReceive(context: Context, intent: Intent) {
                     when (intent.action) {
                         Intent.ACTION_SCREEN_OFF -> service.stopScanner()
-                        Intent.ACTION_SCREEN_ON -> if (service.getAdapter().isEnabled) service.startScanner()
+                        Intent.ACTION_SCREEN_ON -> if (service.adapter.isEnabled) service.startScanner()
                     }
                 }
             },
@@ -98,7 +98,7 @@ private data class Receiver (
 
 private fun bluetoothProfileProxy(service: AirPodsService) : ConnectionListener = object : ConnectionListener {
     override fun register() {
-        service.getAdapter().getProfileProxy(
+        service.adapter.getProfileProxy(
             service.applicationContext,
             object : BluetoothProfile.ServiceListener {
                 override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {

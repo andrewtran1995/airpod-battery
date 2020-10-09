@@ -5,14 +5,13 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
 import android.bluetooth.BluetoothAdapter
-import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.bluetooth.le.*
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.IBinder
-import android.os.ParcelUuid
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
@@ -25,7 +24,7 @@ class AirPodsService : Service() {
     var case: Chargeable = Chargeable.NULL
 
     var airPodModel: AirPodModel? = null
-    val beacons: ArrayList<Beacon> = arrayListOf()
+    val beacons: ArrayList<ScanResult> = arrayListOf()
     val beaconHits: HashMap<String, Int> = hashMapOf()
 
     var connected = false
@@ -35,7 +34,7 @@ class AirPodsService : Service() {
         }
 
     private val listeners: Array<ConnectionListener> by lazy { ConnectionListener.listeners(this) }
-    private val scanner: BluetoothLeScanner by lazy { getAdapter().bluetoothLeScanner }
+    private val scanner: BluetoothLeScanner by lazy { adapter.bluetoothLeScanner }
 
     override fun onCreate() {
         super.onCreate()
@@ -46,7 +45,7 @@ class AirPodsService : Service() {
             Log.e(logTag, "exception when registering listeners", e)
         }
 
-        if (getAdapter().isEnabled) {
+        if (adapter.isEnabled) {
             startScanner()
         } else {
             Log.d(logTag, "bluetooth is not enabled")
@@ -104,13 +103,12 @@ class AirPodsService : Service() {
                     }
 
                     // Trim the list of beacons that have exceeded their TTL.
-                    beacons.add(Beacon(scanResult = result))
+                    beacons.add(result)
                     beaconHits[result.device.address] =
                         beaconHits.getOrDefault(result.device.address, 0) + 1
-                    beacons.removeAll(Beacon::isExpired)
-                    beacons.filterNot { it.scanResult.rssi < -60 }
-                        .maxByOrNull { it.scanResult.rssi }
-                        ?.scanResult
+                    beacons.removeAll { r -> r.isExpired() }
+                    beacons.filterNot { it.rssi < -60 }
+                        .maxByOrNull { it.rssi }
                         ?.getAppleSpecificData()
                         ?.let { decodeHex(it) }
                         ?.let {
@@ -153,19 +151,6 @@ class AirPodsService : Service() {
         )
     }
 
-    /**
-     * Scan results:
-     * * Have fake MAC addresses.
-     * * Do not have UUIDs.
-     * * Do not have meaningful bond states.
-     *
-     * Therefore, we can only rely on the size of the manufacturer specific data bytes specific to Apple.
-     */
-    private fun ScanResult.isDesired(): Boolean = getAppleSpecificData().size == appleBytesSize
-
-    private fun ScanResult.getAppleSpecificData(): ByteArray =
-        this.scanRecord?.getManufacturerSpecificData(manufacturerId) ?: ByteArray(0)
-
     private fun decodeHex(bytes: ByteArray): String = bytes
         .fold("") { s, b ->
             s + String.format("%02X", b)
@@ -188,18 +173,16 @@ class AirPodsService : Service() {
         case = Chargeable.NULL
     }
 
-    internal fun getAdapter(): BluetoothAdapter =
-        (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
+    internal val adapter: BluetoothAdapter
+        get() = (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
 
     inner class NotificationThread : Thread() {
-        private val channel = 1
-        private val channelId = "AirPods"
         private val manager: NotificationManagerCompat by lazy { NotificationManagerCompat.from(this@AirPodsService) }
 
         init {
             manager.createNotificationChannel(
                 NotificationChannel(
-                    channelId,
+                    notificationChannelID,
                     "AirPods Battery",
                     NotificationManager.IMPORTANCE_DEFAULT
                 ).apply {
@@ -213,7 +196,7 @@ class AirPodsService : Service() {
             while (true) {
                 if (connected) {
                     val notification =
-                        NotificationCompat.Builder(this@AirPodsService, channelId).apply {
+                        NotificationCompat.Builder(this@AirPodsService, notificationChannelID).apply {
                             setSmallIcon(R.drawable.ic_launcher_background)
                             setContentTitle("AirPods Battery")
                             setContentText("l:${leftAirPod.display()}, r:${rightAirPod.display()}, case:${case.display()}")
@@ -237,14 +220,14 @@ class AirPodsService : Service() {
 //                        )
                         }.build()
                     try {
-                        manager.notify(channel, notification)
+                        manager.notify(notificationChannel, notification)
                     } catch (e: Exception) {
                         Log.e(logTag, "exception creating notification", e)
-                        manager.cancel(channel)
-                        manager.notify(channel, notification)
+                        manager.cancel(notificationChannel)
+                        manager.notify(notificationChannel, notification)
                     }
                 } else {
-                    manager.cancel(channel)
+                    manager.cancel(notificationChannel)
                 }
 
 
@@ -260,24 +243,26 @@ class AirPodsService : Service() {
     companion object {
         private val logTag: String = AirPodsService::class.simpleName!!
 
+        private const val notificationChannel = 1
+        private const val notificationChannelID = "AirPods"
+
         private const val allBits: Byte = -1
         private const val manufacturerId: Int = 76
         private const val appleBytesSize: Int = 27
+
+        /**
+         * Scan results:
+         * * Have fake MAC addresses.
+         * * Do not have UUIDs.
+         * * Do not have meaningful bond states.
+         *
+         * Therefore, we can only rely on the size of the manufacturer specific data bytes specific to Apple.
+         */
+        private fun ScanResult.isDesired(): Boolean = getAppleSpecificData().size == appleBytesSize
+
+        private fun ScanResult.isExpired(): Boolean = SystemClock.elapsedRealtimeNanos() - timestampNanos > 10_000_000_000
+
+        private fun ScanResult.getAppleSpecificData(): ByteArray =
+            this.scanRecord?.getManufacturerSpecificData(manufacturerId) ?: ByteArray(0)
     }
 }
-
-enum class AirPodModel(
-    val uuid: String
-) {
-    NORMAL("74ec2172-0bad-4d01-8f77-997b2be0722a"),
-    PRO("2a72e02b-7b99-778f-014d-ad0b7221ec74");
-
-    companion object {
-        fun isAirPod(device: BluetoothDevice): Boolean {
-            return device.uuids
-                .intersect(values().map { ParcelUuid.fromString(it.uuid) })
-                .isNotEmpty()
-        }
-    }
-}
-
