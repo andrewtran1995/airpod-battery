@@ -33,6 +33,8 @@ class AirPodsService : Service() {
             field = value
         }
 
+    internal val adapter: BluetoothAdapter
+        get() = (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
     private val listeners: Array<ConnectionListener> by lazy { ConnectionListener.listeners(this) }
     private val scanner: BluetoothLeScanner by lazy { adapter.bluetoothLeScanner }
 
@@ -69,21 +71,6 @@ class AirPodsService : Service() {
     internal fun startScanner() {
         Log.d(logTag, "starting scanner")
 
-        val filters = listOf(
-            ScanFilter.Builder()
-                .setManufacturerData(
-                    manufacturerId,
-                    ByteArray(appleBytesSize).apply {
-                        this[0] = 7
-                        this[1] = 25
-                    },
-                    ByteArray(appleBytesSize).apply {
-                        this[0] = allBits
-                        this[1] = allBits
-                    }
-                )
-                .build()
-        )
         val settings = ScanSettings.Builder().apply {
             setReportDelay(5)
             setScanMode(ScanSettings.SCAN_MODE_LOW_POWER)
@@ -94,7 +81,7 @@ class AirPodsService : Service() {
         }
 
         scanner.startScan(
-            filters,
+            scanFilters,
             settings,
             object : ScanCallback() {
                 override fun onScanResult(callbackType: Int, result: ScanResult) {
@@ -151,14 +138,6 @@ class AirPodsService : Service() {
         )
     }
 
-    private fun decodeHex(bytes: ByteArray): String = bytes
-        .fold("") { s, b ->
-            s + String.format("%02X", b)
-        }
-
-    private fun isDataFlipped(data: String): Boolean =
-        (Integer.parseInt(data[10].toString(), 16) and 0x02) == 0
-
     internal fun stopScanner() {
         Log.d(logTag, "stopping scanner")
         scanner.stopScan(object : ScanCallback() {
@@ -172,9 +151,6 @@ class AirPodsService : Service() {
         rightAirPod = Chargeable.NULL
         case = Chargeable.NULL
     }
-
-    internal val adapter: BluetoothAdapter
-        get() = (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
 
     inner class NotificationThread : Thread() {
         private val manager: NotificationManagerCompat by lazy { NotificationManagerCompat.from(this@AirPodsService) }
@@ -194,61 +170,68 @@ class AirPodsService : Service() {
 
         override fun run() {
             while (true) {
-                if (connected) {
-                    val notification =
-                        NotificationCompat.Builder(this@AirPodsService, notificationChannelID).apply {
-                            setSmallIcon(R.drawable.ic_launcher_background)
-                            setContentTitle("AirPods Battery")
-                            setContentText("l:${leftAirPod.display()}, r:${rightAirPod.display()}, case:${case.display()}")
-
-                            setShowWhen(false)
-                            setOngoing(true)
-                            setAutoCancel(false)
-                            setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-
-//                        setStyle(NotificationCompat.DecoratedCustomViewStyle())
-//                        setCustomContentView(RemoteViews(packageName, R.layout.notification).apply {
-//                            populate(leftAirPod, rightAirPod, case)
-//                        })
-//                        setCustomBigContentView(
-//                            RemoteViews(
-//                                packageName,
-//                                R.layout.notification
-//                            ).apply {
-//                                populate(leftAirPod, rightAirPod, case)
-//                            }
-//                        )
-                        }.build()
-                    try {
-                        manager.notify(notificationChannel, notification)
-                    } catch (e: Exception) {
-                        Log.e(logTag, "exception creating notification", e)
-                        manager.cancel(notificationChannel)
-                        manager.notify(notificationChannel, notification)
-                    }
-                } else {
-                    manager.cancel(notificationChannel)
-                }
-
-
                 try {
-                    sleep(10_000)
+                    if (connected) {
+                        val notification =
+                            NotificationCompat.Builder(this@AirPodsService, notificationChannelID)
+                                .apply {
+                                    setSmallIcon(R.drawable.ic_launcher_background)
+                                    setContentTitle("AirPods Battery")
+                                    setContentText("l:${leftAirPod.display()}, r:${rightAirPod.display()}, case:${case.display()}")
+
+                                    setShowWhen(false)
+                                    setOngoing(true)
+                                    setAutoCancel(false)
+                                    setVibrate(null)
+                                    setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+                                }.build()
+                        try {
+                            manager.notify(notificationChannel, notification)
+                        } catch (e: Exception) {
+                            Log.e(logTag, "exception creating notification", e)
+                            manager.cancel(notificationChannel)
+                            manager.notify(notificationChannel, notification)
+                        }
+                    } else {
+                        manager.cancel(notificationChannel)
+                    }
+
+                    sleep(2_000)
+                } catch (e: InterruptedException) {
+                    Log.d(logTag, "caught InterruptedException", e)
+                    manager.cancel(notificationChannel)
                 } catch (e: Exception) {
-                    Log.e(logTag, "exception thrown during sleep for notification thread", e)
+                    Log.e(logTag, "unexpected exception in notification thread", e)
                 }
             }
         }
     }
 
     companion object {
-        private val logTag: String = AirPodsService::class.simpleName!!
+        private const val logTag: String = "AirPodsService"
 
         private const val notificationChannel = 1
         private const val notificationChannelID = "AirPods"
 
         private const val allBits: Byte = -1
-        private const val manufacturerId: Int = 76
+        private const val manufacturerID: Int = 76
         private const val appleBytesSize: Int = 27
+
+        private val scanFilters = listOf(
+            ScanFilter.Builder()
+                .setManufacturerData(
+                    manufacturerID,
+                    ByteArray(appleBytesSize).apply {
+                        this[0] = 7
+                        this[1] = 25
+                    },
+                    ByteArray(appleBytesSize).apply {
+                        this[0] = allBits
+                        this[1] = allBits
+                    }
+                )
+                .build()
+        )
 
         /**
          * Scan results:
@@ -260,9 +243,18 @@ class AirPodsService : Service() {
          */
         private fun ScanResult.isDesired(): Boolean = getAppleSpecificData().size == appleBytesSize
 
-        private fun ScanResult.isExpired(): Boolean = SystemClock.elapsedRealtimeNanos() - timestampNanos > 10_000_000_000
+        private fun ScanResult.isExpired(): Boolean =
+            SystemClock.elapsedRealtimeNanos() - timestampNanos > 10_000_000_000
 
         private fun ScanResult.getAppleSpecificData(): ByteArray =
-            this.scanRecord?.getManufacturerSpecificData(manufacturerId) ?: ByteArray(0)
+            this.scanRecord?.getManufacturerSpecificData(manufacturerID) ?: ByteArray(0)
+
+        private fun decodeHex(bytes: ByteArray): String = bytes
+            .fold("") { s, b ->
+                s + String.format("%02X", b)
+            }
+
+        private fun isDataFlipped(data: String): Boolean =
+            (Integer.parseInt(data[10].toString(), 16) and 0x02) == 0
     }
 }
