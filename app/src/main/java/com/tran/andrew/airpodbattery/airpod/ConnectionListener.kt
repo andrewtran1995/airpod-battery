@@ -103,11 +103,15 @@ private fun bluetoothProfileProxy(service: AirPodsService) : ConnectionListener 
             object : BluetoothProfile.ServiceListener {
                 override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
                     val h = proxy as BluetoothHeadset
-                    service.connected = h.connectedDevices.any { AirPodModel.isAirPod(it) }
+                    if (h.connectedDevices.any { AirPodModel.isAirPod(it) }) {
+                        service.connected = true
+                        service.startNotification()
+                    }
                 }
 
                 override fun onServiceDisconnected(profile: Int) {
                     service.connected = false
+                    service.stopNotification()
                 }
 
             },

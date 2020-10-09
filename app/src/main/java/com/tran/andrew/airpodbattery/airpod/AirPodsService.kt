@@ -24,8 +24,8 @@ class AirPodsService : Service() {
     var leftAirPod: Chargeable = Chargeable.NULL
     var rightAirPod: Chargeable = Chargeable.NULL
     var case: Chargeable = Chargeable.NULL
-
     var airPodModel: AirPodModel? = null
+
     val beacons: ArrayList<ScanResult> = arrayListOf()
     val beaconHits: HashMap<String, Int> = hashMapOf()
 
@@ -40,6 +40,8 @@ class AirPodsService : Service() {
     private val listeners: Array<ConnectionListener> by lazy { ConnectionListener.listeners(this) }
     private val scanner: BluetoothLeScanner by lazy { adapter.bluetoothLeScanner }
 
+    private var notification: NotificationThread? = null
+
     override fun onCreate() {
         super.onCreate()
 
@@ -49,8 +51,8 @@ class AirPodsService : Service() {
             Log.e(logTag, "exception when registering listeners", e)
         }
 
-        if (adapter.isEnabled) {
-            startScanner()
+        if (adapter.isEnabled && adapter.bondedDevices.any { AirPodModel.isAirPod(it) }) {
+            startNotification()
         } else {
             Log.d(logTag, "bluetooth is not enabled")
         }
@@ -154,9 +156,21 @@ class AirPodsService : Service() {
         case = Chargeable.NULL
     }
 
+    internal fun startNotification() {
+        startScanner()
+        notification = NotificationThread().apply {
+            start()
+        }
+    }
+
+    internal fun stopNotification() {
+        notification?.interrupt()
+        stopScanner()
+    }
+
     inner class NotificationThread : Thread() {
         private val manager: NotificationManagerCompat by lazy { NotificationManagerCompat.from(this@AirPodsService) }
-        private val notificationBuilder: NotificationCompat.Builder =
+        private val builder: NotificationCompat.Builder =
             NotificationCompat.Builder(this@AirPodsService, notificationChannelID).apply {
                 setSmallIcon(R.drawable.ic_launcher_background)
                 setContentTitle("AirPods Battery")
@@ -191,7 +205,7 @@ class AirPodsService : Service() {
             while (true) {
                 try {
                     if (connected) {
-                        val notification = notificationBuilder.apply {
+                        val notification = builder.apply {
                             setContentText("l:${leftAirPod.display()}, r:${rightAirPod.display()}, case:${case.display()}")
                         }.build()
                         try {
