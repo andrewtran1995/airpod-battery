@@ -29,16 +29,72 @@ class AirPodsService : Service() {
     val beacons: ArrayList<ScanResult> = arrayListOf()
     val beaconHits: HashMap<String, Int> = hashMapOf()
 
-    var connected = false
+    var airpodsConnected = false
         set(value) {
-            Log.d(logTag, "connected set to $value")
+            Log.d(logTag, "airpodsConnected set to $value")
             field = value
         }
+    var scanSuccessful = false
 
     internal val adapter: BluetoothAdapter
         get() = (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
     private val listeners: Array<ConnectionListener> by lazy { ConnectionListener.listeners(this) }
+
     private val scanner: BluetoothLeScanner by lazy { adapter.bluetoothLeScanner }
+    private var scanCallback = object : ScanCallback() {
+        override fun onScanResult(callbackType: Int, result: ScanResult) {
+            if (!result.isDesired()) {
+                return
+            }
+
+            // Trim the list of beacons that have exceeded their TTL.
+            beacons.add(result)
+            beaconHits[result.device.address] =
+                beaconHits.getOrDefault(result.device.address, 0) + 1
+            beacons.removeAll { r -> r.isExpired() }
+            beacons.filterNot { it.rssi < -60 }
+                .maxByOrNull { it.rssi }
+                ?.getAppleSpecificData()
+                ?.let { decodeHex(it) }
+                ?.let {
+                    Integer.parseInt(it[14].toString(), 16).let { chargeStatus ->
+                        leftAirPod = Chargeable(
+                            Integer.parseInt(it[13].toString(), 16),
+                            (chargeStatus and 0b1) != 0
+                        )
+                        rightAirPod = Chargeable(
+                            Integer.parseInt(it[12].toString(), 16),
+                            (chargeStatus and 0b10) != 0
+                        )
+                        case = Chargeable(
+                            Integer.parseInt(it[15].toString(), 16),
+                            (chargeStatus and 0b100) != 0
+                        )
+                    }
+                    if (isDataFlipped(it)) {
+                        leftAirPod = rightAirPod.also { rightAirPod = leftAirPod }
+                    }
+
+                    airPodModel = when (it[7]) {
+                        'E' -> AirPodModel.PRO
+                        else -> AirPodModel.NORMAL
+                    }
+
+                    scanSuccessful = true
+                }
+            Log.d(logTag, "beaconHits: $beaconHits")
+        }
+
+        override fun onBatchScanResults(results: MutableList<ScanResult>) {
+            results.forEach { onScanResult(ScanSettings.CALLBACK_TYPE_ALL_MATCHES, it) }
+            super.onBatchScanResults(results)
+        }
+
+        override fun onScanFailed(errorCode: Int) {
+            Log.d(this.javaClass.name, "scan failed")
+            super.onScanFailed(errorCode)
+        }
+    }
 
     private var notification: NotificationThread? = null
 
@@ -72,7 +128,7 @@ class AirPodsService : Service() {
         super.onDestroy()
     }
 
-    internal fun startScanner() {
+    private fun startScanner() {
         Log.d(logTag, "starting scanner")
 
         val settings = ScanSettings.Builder().apply {
@@ -87,73 +143,22 @@ class AirPodsService : Service() {
         scanner.startScan(
             scanFilters,
             settings,
-            object : ScanCallback() {
-                override fun onScanResult(callbackType: Int, result: ScanResult) {
-                    if (!result.isDesired()) {
-                        return
-                    }
-
-                    // Trim the list of beacons that have exceeded their TTL.
-                    beacons.add(result)
-                    beaconHits[result.device.address] =
-                        beaconHits.getOrDefault(result.device.address, 0) + 1
-                    beacons.removeAll { r -> r.isExpired() }
-                    beacons.filterNot { it.rssi < -60 }
-                        .maxByOrNull { it.rssi }
-                        ?.getAppleSpecificData()
-                        ?.let { decodeHex(it) }
-                        ?.let {
-                            Integer.parseInt(it[14].toString(), 16).let { chargeStatus ->
-                                leftAirPod = Chargeable(
-                                    Integer.parseInt(it[13].toString(), 16),
-                                    (chargeStatus and 0b1) != 0
-                                )
-                                rightAirPod = Chargeable(
-                                    Integer.parseInt(it[12].toString(), 16),
-                                    (chargeStatus and 0b10) != 0
-                                )
-                                case = Chargeable(
-                                    Integer.parseInt(it[15].toString(), 16),
-                                    (chargeStatus and 0b100) != 0
-                                )
-                            }
-                            if (isDataFlipped(it)) {
-                                leftAirPod = rightAirPod.also { rightAirPod = leftAirPod }
-                            }
-
-                            airPodModel = when (it[7]) {
-                                'E' -> AirPodModel.PRO
-                                else -> AirPodModel.NORMAL
-                            }
-                        }
-                    Log.d(logTag, "beaconHits: $beaconHits")
-                }
-
-                override fun onBatchScanResults(results: MutableList<ScanResult>) {
-                    results.forEach { onScanResult(ScanSettings.CALLBACK_TYPE_ALL_MATCHES, it) }
-                    super.onBatchScanResults(results)
-                }
-
-                override fun onScanFailed(errorCode: Int) {
-                    Log.d(this.javaClass.name, "scan failed")
-                    super.onScanFailed(errorCode)
-                }
-            }
+            scanCallback
         )
     }
 
-    internal fun stopScanner() {
+    private fun stopScanner() {
         Log.d(logTag, "stopping scanner")
-        scanner.stopScan(object : ScanCallback() {
-            override fun onScanResult(callbackType: Int, result: ScanResult) {
-            }
-        })
+        scanner.stopScan(scanCallback)
+        scanner.flushPendingScanResults(scanCallback)
 
         beacons.clear()
 
         leftAirPod = Chargeable.NULL
         rightAirPod = Chargeable.NULL
         case = Chargeable.NULL
+
+        scanSuccessful = false
     }
 
     internal fun startNotification() {
@@ -163,9 +168,17 @@ class AirPodsService : Service() {
         }
     }
 
+    /** Stops the notification view, even if the AirPods may still be connected. */
     internal fun stopNotification() {
         notification?.interrupt()
         stopScanner()
+    }
+
+    /** Disconnect should be called when the caller is confident the AirPods
+     * are no longer connected, and that all views should be stopped. */
+    internal fun disconnect() {
+        airpodsConnected = false
+        stopNotification()
     }
 
     inner class NotificationThread : Thread() {
@@ -202,9 +215,9 @@ class AirPodsService : Service() {
         }
 
         override fun run() {
-            while (true) {
-                try {
-                    if (connected) {
+            try {
+                while (true) {
+                    if (scanSuccessful) {
                         val notification = builder.apply {
                             setContentText("l:${leftAirPod.display()}, r:${rightAirPod.display()}, case:${case.display()}")
                         }.build()
@@ -220,18 +233,18 @@ class AirPodsService : Service() {
                     }
 
                     sleep(2_000)
-                } catch (e: InterruptedException) {
-                    Log.d(logTag, "caught InterruptedException", e)
-                    manager.cancel(notificationChannel)
-                } catch (e: Exception) {
-                    Log.e(logTag, "unexpected exception in notification thread", e)
                 }
+            } catch (e: InterruptedException) {
+                Log.d(logTag, "caught InterruptedException", e)
+                manager.cancel(notificationChannel)
+            } catch (e: Exception) {
+                Log.e(logTag, "unexpected exception in notification thread", e)
             }
         }
     }
 
     companion object {
-        private const val logTag: String = "AirPodsService"
+        internal const val logTag: String = "AirPodsService"
 
         private const val notificationChannel = 1
         private const val notificationChannelID = "AirPods"
