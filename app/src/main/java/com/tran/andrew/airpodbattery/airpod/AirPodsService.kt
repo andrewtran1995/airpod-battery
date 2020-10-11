@@ -6,6 +6,8 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothHeadset
 import android.bluetooth.BluetoothManager
 import android.bluetooth.le.*
 import android.content.Context
@@ -21,80 +23,17 @@ import com.tran.andrew.airpodbattery.R
 import kotlin.collections.ArrayList
 
 class AirPodsService : Service() {
-    var leftAirPod: Chargeable = Chargeable.NULL
-    var rightAirPod: Chargeable = Chargeable.NULL
-    var case: Chargeable = Chargeable.NULL
-    var airPodModel: AirPodModel? = null
-
-    val beacons: ArrayList<ScanResult> = arrayListOf()
-    val beaconHits: HashMap<String, Int> = hashMapOf()
-
     var airpodsConnected = false
         set(value) {
             Log.d(logTag, "airpodsConnected set to $value")
             field = value
         }
-    var scanSuccessful = false
+
+    private val listeners: Array<ConnectionListener> by lazy { ConnectionListener.listeners(this) }
 
     internal val adapter: BluetoothAdapter
         get() = (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
-    private val listeners: Array<ConnectionListener> by lazy { ConnectionListener.listeners(this) }
-
-    private val scanner: BluetoothLeScanner by lazy { adapter.bluetoothLeScanner }
-    private var scanCallback = object : ScanCallback() {
-        override fun onScanResult(callbackType: Int, result: ScanResult) {
-            if (!result.isDesired()) {
-                return
-            }
-
-            // Trim the list of beacons that have exceeded their TTL.
-            beacons.add(result)
-            beaconHits[result.device.address] =
-                beaconHits.getOrDefault(result.device.address, 0) + 1
-            beacons.removeAll { r -> r.isExpired() }
-            beacons.filterNot { it.rssi < -60 }
-                .maxByOrNull { it.rssi }
-                ?.getAppleSpecificData()
-                ?.let { decodeHex(it) }
-                ?.let {
-                    Integer.parseInt(it[14].toString(), 16).let { chargeStatus ->
-                        leftAirPod = Chargeable(
-                            Integer.parseInt(it[13].toString(), 16),
-                            (chargeStatus and 0b1) != 0
-                        )
-                        rightAirPod = Chargeable(
-                            Integer.parseInt(it[12].toString(), 16),
-                            (chargeStatus and 0b10) != 0
-                        )
-                        case = Chargeable(
-                            Integer.parseInt(it[15].toString(), 16),
-                            (chargeStatus and 0b100) != 0
-                        )
-                    }
-                    if (isDataFlipped(it)) {
-                        leftAirPod = rightAirPod.also { rightAirPod = leftAirPod }
-                    }
-
-                    airPodModel = when (it[7]) {
-                        'E' -> AirPodModel.PRO
-                        else -> AirPodModel.NORMAL
-                    }
-
-                    scanSuccessful = true
-                }
-            Log.d(logTag, "beaconHits: $beaconHits")
-        }
-
-        override fun onBatchScanResults(results: MutableList<ScanResult>) {
-            results.forEach { onScanResult(ScanSettings.CALLBACK_TYPE_ALL_MATCHES, it) }
-            super.onBatchScanResults(results)
-        }
-
-        override fun onScanFailed(errorCode: Int) {
-            Log.d(this.javaClass.name, "scan failed")
-            super.onScanFailed(errorCode)
-        }
-    }
+    private val airpodScanner: AirPodScanner by lazy { AirPodScanner(adapter.bluetoothLeScanner) }
 
     private var notification: NotificationThread? = null
 
@@ -107,16 +46,18 @@ class AirPodsService : Service() {
             Log.e(logTag, "exception when registering listeners", e)
         }
 
-        if (adapter.isEnabled && adapter.bondedDevices.any { AirPodModel.isAirPod(it) }) {
+        if (adapter.isEnabled && adapter.bondedDevices.any { AirPodModel.isAirPod(it) && it.isConnected() }) {
             startNotification()
         } else {
             Log.d(logTag, "bluetooth is not enabled")
         }
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        NotificationThread().start()
-        return super.onStartCommand(intent, flags, startId)
+    private fun BluetoothDevice.isConnected(): Boolean = try {
+        BluetoothDevice::class.java.getMethod("isConnected").invoke(this) as Boolean
+    } catch (e: Exception) {
+        Log.e(logTag, "exception when checking if Bluetooth device connected", e)
+        throw e
     }
 
     override fun onBind(intent: Intent?): IBinder? {
@@ -131,34 +72,16 @@ class AirPodsService : Service() {
     private fun startScanner() {
         Log.d(logTag, "starting scanner")
 
-        val settings = ScanSettings.Builder().apply {
-            setReportDelay(1)
-            setScanMode(ScanSettings.SCAN_MODE_LOW_POWER)
-        }.build()
-
         if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_DENIED) {
             Log.d(this.javaClass.name, "permission denied!")
         }
 
-        scanner.startScan(
-            scanFilters,
-            settings,
-            scanCallback
-        )
+        airpodScanner.startScan()
     }
 
     private fun stopScanner() {
         Log.d(logTag, "stopping scanner")
-        scanner.stopScan(scanCallback)
-        scanner.flushPendingScanResults(scanCallback)
-
-        beacons.clear()
-
-        leftAirPod = Chargeable.NULL
-        rightAirPod = Chargeable.NULL
-        case = Chargeable.NULL
-
-        scanSuccessful = false
+        airpodScanner.stopScan()
     }
 
     internal fun startNotification() {
@@ -183,23 +106,22 @@ class AirPodsService : Service() {
 
     inner class NotificationThread : Thread() {
         private val manager: NotificationManagerCompat by lazy { NotificationManagerCompat.from(this@AirPodsService) }
-        private val builder: NotificationCompat.Builder =
-            NotificationCompat.Builder(this@AirPodsService, notificationChannelID).apply {
-                setSmallIcon(R.drawable.ic_launcher_background)
-                setContentTitle("AirPods Battery")
+        private val builder = NotificationCompat.Builder(this@AirPodsService, notificationChannelID).apply {
+            setSmallIcon(R.drawable.ic_launcher_background)
+            setContentTitle("AirPods Battery")
 
-                setShowWhen(false)
-                setOngoing(true)
-                setOnlyAlertOnce(true)
-                setVibrate(null)
-                setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            setShowWhen(false)
+            setOngoing(true)
+            setOnlyAlertOnce(true)
+            setVibrate(null)
+            setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
 
-                val intent = Intent(this@AirPodsService, MainActivity::class.java).apply {
-                    flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
-                }
-                setContentIntent(PendingIntent.getActivity(this@AirPodsService, 0, intent, 0))
-                setAutoCancel(false)
+            val intent = Intent(this@AirPodsService, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
             }
+            setContentIntent(PendingIntent.getActivity(this@AirPodsService, 0, intent, 0))
+            setAutoCancel(false)
+        }
 
         init {
             manager.createNotificationChannel(
@@ -217,9 +139,9 @@ class AirPodsService : Service() {
         override fun run() {
             try {
                 while (true) {
-                    if (scanSuccessful) {
+                    if (airpodScanner.scanSuccessful) {
                         val notification = builder.apply {
-                            setContentText("l:${leftAirPod.display()}, r:${rightAirPod.display()}, case:${case.display()}")
+                            setContentText("l:${airpodScanner.left.display()}, r:${airpodScanner.right.display()}, case:${airpodScanner.case.display()}")
                         }.build()
                         try {
                             manager.notify(notificationChannel, notification)
@@ -248,49 +170,5 @@ class AirPodsService : Service() {
 
         private const val notificationChannel = 1
         private const val notificationChannelID = "AirPods"
-
-        private const val allBits: Byte = -1
-        private const val manufacturerID: Int = 76
-        private const val appleBytesSize: Int = 27
-
-        private val scanFilters = listOf(
-            ScanFilter.Builder()
-                .setManufacturerData(
-                    manufacturerID,
-                    ByteArray(appleBytesSize).apply {
-                        this[0] = 7
-                        this[1] = 25
-                    },
-                    ByteArray(appleBytesSize).apply {
-                        this[0] = allBits
-                        this[1] = allBits
-                    }
-                )
-                .build()
-        )
-
-        /**
-         * Scan results:
-         * * Have fake MAC addresses.
-         * * Do not have UUIDs.
-         * * Do not have meaningful bond states.
-         *
-         * Therefore, we can only rely on the size of the manufacturer specific data bytes specific to Apple.
-         */
-        private fun ScanResult.isDesired(): Boolean = getAppleSpecificData().size == appleBytesSize
-
-        private fun ScanResult.isExpired(): Boolean =
-            SystemClock.elapsedRealtimeNanos() - timestampNanos > 10_000_000_000
-
-        private fun ScanResult.getAppleSpecificData(): ByteArray =
-            this.scanRecord?.getManufacturerSpecificData(manufacturerID) ?: ByteArray(0)
-
-        private fun decodeHex(bytes: ByteArray): String = bytes
-            .fold("") { s, b ->
-                s + String.format("%02X", b)
-            }
-
-        private fun isDataFlipped(data: String): Boolean =
-            (Integer.parseInt(data[10].toString(), 16) and 0x02) == 0
     }
 }
