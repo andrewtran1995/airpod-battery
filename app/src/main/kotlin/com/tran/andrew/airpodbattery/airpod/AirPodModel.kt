@@ -10,12 +10,11 @@ enum class AirPodModel(
     PRO("2a72e02b-7b99-778f-014d-ad0b7221ec74");
 
     companion object {
-        private val uuids = values().map { ParcelUuid.fromString(it.uuid) }
+        private val UUIDs = values().map { ParcelUuid.fromString(it.uuid) }
 
-        fun isAirPod(device: BluetoothDevice): Boolean {
-            return device.uuids
-                .intersect(uuids)
+        fun isAirPod(device: BluetoothDevice): Boolean =
+            device.uuids
+                .intersect(UUIDs)
                 .isNotEmpty()
-        }
     }
 }

@@ -2,11 +2,14 @@ plugins {
     id("com.android.application")
     id("kotlin-android")
     id("kotlin-android-extensions")
+    id("org.jlleitschuh.gradle.ktlint") version "9.4.0"
 }
 
 android {
     compileSdkVersion(29)
     buildToolsVersion("30.0.2")
+
+    sourceSets.all { java.srcDir("src/$name/kotlin") }
 
     defaultConfig {
         applicationId = "com.tran.andrew.airpodbattery"

@@ -28,31 +28,31 @@ internal class AirPodScanner(private val scanner: BluetoothLeScanner){
             // Trim the list of beacons that have exceeded their TTL.
             beacons.add(result)
             beaconHits[result.device.address] = beaconHits.getOrDefault(result.device.address, 0) + 1
-            beacons.removeAll { r -> r.isExpired() }
+            beacons.removeAll { it.isExpired() }
             beacons.filterNot { it.rssi < -60 }
                 .maxByOrNull { it.rssi }
                 ?.getAppleSpecificData()
-                ?.let { decodeHex(it) }
-                ?.let {
-                    Integer.parseInt(it[14].toString(), 16).let { chargeStatus ->
+                ?.let { decodeBytesAsHexData(it) }
+                ?.let { data ->
+                    Integer.parseInt(data[14].toString(), 16).let { chargeStatus ->
                         left = Chargeable(
-                            Integer.parseInt(it[13].toString(), 16),
+                            Integer.parseInt(data[13].toString(), 16),
                             (chargeStatus and 0b1) != 0
                         )
                         right = Chargeable(
-                            Integer.parseInt(it[12].toString(), 16),
+                            Integer.parseInt(data[12].toString(), 16),
                             (chargeStatus and 0b10) != 0
                         )
                         case = Chargeable(
-                            Integer.parseInt(it[15].toString(), 16),
+                            Integer.parseInt(data[15].toString(), 16),
                             (chargeStatus and 0b100) != 0
                         )
                     }
-                    if (isDataFlipped(it)) {
+                    if (isDataFlipped(data)) {
                         left = right.also { right = left }
                     }
 
-                    model = when (it[7]) {
+                    model = when (data[7]) {
                         'E' -> AirPodModel.PRO
                         else -> AirPodModel.NORMAL
                     }
@@ -127,8 +127,8 @@ internal class AirPodScanner(private val scanner: BluetoothLeScanner){
         private fun ScanResult.getAppleSpecificData(): ByteArray =
             this.scanRecord?.getManufacturerSpecificData(manufacturerID) ?: ByteArray(0)
 
-        private fun decodeHex(bytes: ByteArray): String = bytes
-            .fold("") { s, b ->
+        private fun decodeBytesAsHexData(bytes: ByteArray): String =
+            bytes.fold("") { s, b ->
                 s + String.format("%02X", b)
             }
 
